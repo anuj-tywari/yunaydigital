@@ -1,0 +1,211 @@
+name: CD - Deploy from latest CI artifact
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "Environment to deploy to"
+        required: true
+        type: choice
+        options: [staging, production]
+
+env:
+  APP_NAME: yunay-digital
+  CI_WORKFLOW_NAME: "CI - Build, Test, Security & Quality"
+
+jobs:
+  deploy:
+    name: "Deploy (download CI artifact → EC2)"
+    runs-on: [self-hosted, linux]
+    environment:
+      name: ${{ github.event_name == 'release' && 'production' || inputs.environment }}
+    concurrency:
+      group: deploy-${{ github.event_name == 'release' && 'production' || inputs.environment }}
+      cancel-in-progress: false
+    permissions:
+      contents: read
+
+    steps:
+      - name: "Checkout (metadata only)"
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: "Install gh & jq if missing"
+        run: |
+          set -euo pipefail
+          if ! command -v jq >/dev/null 2>&1; then
+            sudo apt-get update -y
+            sudo apt-get install -y jq
+          fi
+          if ! command -v gh >/dev/null 2>&1; then
+            curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
+              | sudo dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg
+            sudo chmod go+r /usr/share/keyrings/githubcli-archive-keyring.gpg
+            echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
+              | sudo tee /etc/apt/sources.list.d/github-cli.list > /dev/null
+            sudo apt-get update -y
+            sudo apt-get install -y gh
+          fi
+
+      - name: "Authenticate gh"
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }} # use PAT with repo+workflow if your org restricts this
+        run: |
+          echo "$GITHUB_TOKEN" | gh auth login --with-token >/dev/null
+
+      - name: "Find latest successful CI run"
+        id: find_run
+        run: |
+          set -euo pipefail
+          RUN_ID=$(gh run list \
+            --workflow "${{ env.CI_WORKFLOW_NAME }}" \
+            --status success \
+            --limit 1 \
+            --json databaseId \
+            --jq '.[0].databaseId' 2>/dev/null || true)
+          if [ -z "$RUN_ID" ] || [ "$RUN_ID" = "null" ]; then
+            echo "No successful CI run found for ${{ env.CI_WORKFLOW_NAME }}"
+            exit 1
+          fi
+          echo "ci_run_id=$RUN_ID" >> $GITHUB_OUTPUT
+          echo "Found CI run id: $RUN_ID"
+
+      - name: "Download deploy artifact from CI run"
+        id: download_artifact
+        env:
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          CI_RUN_ID="${{ steps.find_run.outputs.ci_run_id }}"
+
+          # List artifacts for that run (REST API)
+          ART_JSON=$(gh api repos/"$REPO"/actions/runs/"$CI_RUN_ID"/artifacts)
+
+          # Pick the first artifact whose name starts with "deploy-"
+          ART_ID=$(echo "$ART_JSON"  | jq -r '.artifacts[] | select(.name|startswith("deploy-")) | .id'   | head -n1 || true)
+          ART_NM=$(echo "$ART_JSON"  | jq -r '.artifacts[] | select(.name|startswith("deploy-")) | .name' | head -n1 || true)
+
+          if [ -z "$ART_ID" ] || [ "$ART_ID" = "null" ]; then
+            echo "No artifact starting with 'deploy-' found. Available:"
+            echo "$ART_JSON" | jq -r '.artifacts[] | "\(.id) \(.name)"'
+            exit 1
+          fi
+          echo "Artifact: $ART_NM (id: $ART_ID)"
+
+          # Download artifact ZIP → unzip → find deploy.tar.gz
+          gh api repos/"$REPO"/actions/artifacts/"$ART_ID"/zip --output artifact.zip
+          mkdir -p artifact_unpacked
+          unzip -q artifact.zip -d artifact_unpacked || true
+
+          TAR=$(find artifact_unpacked -type f -name "deploy*.tar.gz" | head -n1 || true)
+          if [ -z "$TAR" ]; then
+            TAR=$(find artifact_unpacked -type f -name "*.tar.gz" | head -n1 || true)
+          fi
+          if [ -z "$TAR" ]; then
+            echo "No .tar.gz found inside artifact. Contents:"
+            find artifact_unpacked -maxdepth 3 -type f -print
+            exit 1
+          fi
+
+          mv "$TAR" ./deploy.tar.gz
+          echo "artifact_path=./deploy.tar.gz" >> $GITHUB_OUTPUT
+          echo "artifact_name=$ART_NM" >> $GITHUB_OUTPUT
+          echo "Saved deploy.tar.gz (size: $(stat -c%s deploy.tar.gz || echo 0) bytes)"
+
+      - name: "Verify artifact"
+        run: |
+          set -euo pipefail
+          FILE="${{ steps.download_artifact.outputs.artifact_path }}"
+          [ -f "$FILE" ] || (echo "deploy.tar.gz not found" && exit 1)
+          SIZE=$(stat -c%s "$FILE" || echo 0)
+          echo "Artifact size: $SIZE"
+          [ "$SIZE" -ge 1024 ] || (echo "Artifact too small" && exit 1)
+
+      - name: "Load SSH key"
+        uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.EC2_SSH_KEY }}
+
+      - name: "Upload artifact to EC2"
+        run: |
+          scp -o StrictHostKeyChecking=no \
+            "${{ steps.download_artifact.outputs.artifact_path }}" \
+            "${{ secrets.DEPLOY_USER }}@${{ secrets.EC2_HOST }}:/tmp/deploy.tar.gz"
+
+      - name: "Remote deploy (blue/green via pm2)"
+        env:
+          APP_NAME: ${{ env.APP_NAME }}
+        run: |
+          ssh -o StrictHostKeyChecking=no "${{ secrets.DEPLOY_USER }}@${{ secrets.EC2_HOST }}" 'bash -s' <<'EOF'
+            set -euo pipefail
+            APP="${APP_NAME:-yunay-digital}"
+            BASE="/var/www"
+            BLUE="${BASE}/${APP}-blue"
+            GREEN="${BASE}/${APP}-green"
+            CURRENT="${BASE}/${APP}"
+
+            # Decide target dir
+            if [ -L "$CURRENT" ] && [ "$(readlink -f "$CURRENT")" = "$BLUE" ]; then
+              NEW="$GREEN"; OLD="$BLUE"; PORT=3002
+            else
+              NEW="$BLUE";  OLD="$GREEN"; PORT=3001
+            fi
+
+            echo "Deploying to: $NEW (old: $OLD), port: $PORT"
+
+            sudo rm -rf "$NEW"
+            sudo mkdir -p "$NEW"
+            sudo chown -R $(whoami):$(whoami) "$NEW"
+
+            tar -xzf /tmp/deploy.tar.gz -C "$NEW"
+            cd "$NEW"
+
+            # Production deps
+            npm ci --only=production
+
+            # Start/Reload with pm2
+            NAME="${APP}-$(basename "$NEW" | sed -E "s/.*-//")"
+            if [ -f ecosystem.config.js ]; then
+              PORT=$PORT pm2 start ecosystem.config.js --name "$NAME" --update-env || pm2 reload "$NAME" --update-env || true
+            else
+              PORT=$PORT pm2 start npm --name "$NAME" -- start -- --port $PORT || pm2 reload "$NAME" --update-env || true
+            fi
+
+            # Switch symlink
+            sudo ln -sfn "$NEW" "$CURRENT"
+
+            # Reload Nginx if present
+            if command -v nginx >/dev/null 2>&1; then
+              sudo nginx -t && sudo systemctl reload nginx || true
+            fi
+
+            # Cleanup
+            rm -f /tmp/deploy.tar.gz
+
+            echo "✅ Deployed to $NEW"
+          EOF
+
+      - name: "Smoke check"
+        run: |
+          if [ "${{ github.event_name }}" = "release" ] || [ "${{ inputs.environment }}" = "production" ]; then
+            URL="${{ secrets.PRODUCTION_URL }}"
+          else
+            URL="${{ secrets.STAGING_URL }}"
+          fi
+          if [ -z "$URL" ]; then
+            echo "No URL configured; skipping smoke check."
+            exit 0
+          fi
+          echo "Checking $URL/api/health ..."
+          for i in 1 2 3; do
+            if curl -fs --max-time 5 "$URL/api/health"; then
+              echo "Health OK"
+              exit 0
+            fi
+            sleep 3
+          done
+          echo "❌ Smoke check failed"
+          exit 1

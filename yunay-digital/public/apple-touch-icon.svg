@@ -1,0 +1,12 @@
+<svg viewBox="0 0 180 180" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="radiant180" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#8b5cf6"/>
+      <stop offset="55%" stop-color="#d946ef"/>
+      <stop offset="100%" stop-color="#22d3ee"/>
+    </linearGradient>
+  </defs>
+  <rect width="180" height="180" rx="40" fill="url(#radiant180)"/>
+  <path d="M51 51 L90 98 M129 51 L90 98 M90 98 V141" stroke="white" stroke-width="24" stroke-linecap="round" stroke-linejoin="round" fill="none"/>
+  <path d="M138 24 l5.5 12.8 12.8 5.5 -12.8 5.5 -5.5 12.8 -5.5 -12.8 -12.8 -5.5 12.8 -5.5 z" fill="#fdf4ff" opacity="0.95"/>
+</svg>
